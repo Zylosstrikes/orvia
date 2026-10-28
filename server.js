@@ -38,7 +38,8 @@ async function search(q, page, cc, nc) {
   let used = q, corrected = null;
   const relevantCount = (l) => l.filter((r) => coverage(pq, r) >= 0.5).length;
   // poor / off-topic results -> retry with conversational filler removed, then with content words only
-  if (!wq) for (const alt of [cleaned, keywordQuery(plain)]) {
+  const defM = plain.match(/^(?:define|definition of|meaning of|what does (\S+) mean)\s*(.*)$/i), defAlt = defM ? ((defM[1] || defM[2] || '').trim() + ' meaning').trim() : '';
+  if (!wq) for (const alt of [defAlt, cleaned, keywordQuery(plain), '"' + keywordQuery(plain).split(' ').join('" "') + '"']) {
     if (results.length >= 4 && relevantCount(results) >= 3) break;
     if (!alt || alt.toLowerCase() === plain.toLowerCase() || alt === used) continue;
     const altQ = pq.raw.replace(plain, alt), r2 = await S.bingWeb(altQ, page, cc);
