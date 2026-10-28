@@ -50,16 +50,17 @@ async function search(q, page, cc, nc) {
   const cand = [...sugg.slice(0, 4), inst.suggestion].filter(Boolean);
   const hasLetters = /[a-z]{3}/i.test(plain), pl = plain.toLowerCase();
   if (hasLetters && !inst.answers.some((a) => ['calc', 'convert'].includes(a.type))) {
-    let best = null;
-    for (const c of cand) { const d = lev(plain, c), cl = c.toLowerCase(); if (cl !== pl && !cl.startsWith(pl) && !pl.startsWith(cl) && d >= 1 && d <= Math.max(2, Math.floor(plain.length * 0.3)) && (!best || d < best.d)) best = { c, d }; }
+    let best = null; const pt = plain.toLowerCase().split(/\s+/);
+    for (const c of cand) { const d = lev(plain, c), cl = c.toLowerCase(); if (pt.length > 1 && pt.every((w) => cl.split(/\s+/).includes(w))) continue; if (cl !== pl && !cl.startsWith(pl) && !pl.startsWith(cl) && d >= 1 && d <= Math.max(2, Math.floor(plain.length * 0.3)) && (!best || d < best.d)) best = { c, d }; }
     if (best) dym = best.c;
   }
-  if (results.length < 3 && dym && first && !nc) { const r3 = await S.bingWeb(dym, 1, cc); if (r3.results.length) { corrected = { from: q, to: dym }; results = S.mergeUniq(r3.results, results); source = source || r3.source; dym = ''; } }
+  if ((results.length < 3 || relevantCount(results) < 3) && dym && first && !nc) { const r3 = await S.bingWeb(dym, 1, cc); if (r3.results.length && relevantCount(r3.results) >= relevantCount(results)) { corrected = { from: q, to: dym }; results = S.mergeUniq(r3.results, results); source = source || r3.source; dym = ''; } }
   // all Bing variants failed (e.g. datacentre IP limited) -> other keyless sources
   let degraded = false, message = '';
-  if (results.length < 3) {
-    const fb = await S.fallbackWeb(cleaned || plain, page);
-    if (fb.results.length) { degraded = true; results = S.mergeUniq(results, fb.results); source = results.length === fb.results.length ? fb.source : (source || fb.source); message = source === 'wikipedia' ? 'Web search sources are limited right now, so these results come from Wikipedia only. Please try again in a moment.' : `Primary search source was unavailable; showing results from ${source}.`; }
+  const poor = results.length < 3 || (!wq && relevantCount(results) < 3);
+  if (poor) {
+    const fb = await S.fallbackWeb(keywordQuery(cleaned || plain), page);
+    if (fb.results.length && (results.length < 3 || relevantCount(fb.results) > 0)) { degraded = results.length < 3; results = S.mergeUniq(results, fb.results); source = results.length === fb.results.length ? fb.source : (source || fb.source); message = !degraded ? '' : source === 'wikipedia' ? 'Web search sources are limited right now, so these results come from Wikipedia only. Please try again in a moment.' : `Primary search source was unavailable; showing results from ${source}.`; }
   }
   if (source !== 'bing' || degraded) results = applyOps(pq, results); // honour site:/-term/filetype: when the upstream didn't
   if (wq) { // keep weather results about the requested place; add a reliable forecast link
@@ -67,6 +68,7 @@ async function search(q, page, cc, nc) {
     results = hit;
     if (wq.id) results.unshift({ title: `${wq.full} – BBC Weather`, url: `https://www.bbc.com/weather/${wq.id}`, snippet: `Hourly and 14-day forecast for ${wq.full} from BBC Weather.` });
   }
+  if (!wq && relevantCount(results) >= 4) results = results.filter((r) => coverage(pq, r) >= 0.34); // drop clearly off-topic hits when enough good ones exist
   results = rankResults(pq, results).slice(0, 14);
   const ans = inst.answers.slice(), mathy = ans.some((a) => ['calc', 'convert', 'time', 'weather'].includes(a.type));
   const wikiPanel = ans.find((a) => a.type === 'wiki');
