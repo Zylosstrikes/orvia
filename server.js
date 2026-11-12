@@ -3,7 +3,7 @@ const { health, withTimeout } = require('./lib/http');
 const S = require('./lib/sources');
 const { parseQuery, cleanQuery, keywordQuery, rankResults, applyOps, lev, coverage } = require('./lib/query');
 const { instantAnswers, weatherQuery } = require('./lib/answers');
-const PORT = process.env.PORT || 3000, HOST = '0.0.0.0', PUB = path.join(__dirname, 'public'), VERSION = '2.0.0', STARTED = Date.now();
+const PORT = process.env.PORT || 3000, HOST = '0.0.0.0', PUB = path.join(__dirname, 'public'), VERSION = '2.1.0', STARTED = Date.now();
 
 // ---------- helpers ----------
 const STOP = new Set(['the', 'and', 'for', 'news', 'new', 'latest', 'price', 'best', 'what', 'how', 'today', '2026', 'releases', 'update', 'updates']);
@@ -26,6 +26,35 @@ function summarize(q, res, wikiText) {
   return sents.sort((a, b) => b.score - a.score).filter((x) => { const k = x.s.slice(0, 30).toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 5).map((x) => ({ text: x.s, ref: x.i + 1 })).filter((x) => x.ref >= 1 || true);
 }
 const NEWSY = /\b(news|latest|today|live|score|scores|results?|vs\.?|versus|match|fixtures?|election|breaking|update|updates|headlines|transfer|price of|stock|crash|fire|accident|strike|protest)\b/i;
+
+
+// ---------- outbound links ----------
+// only absolute http(s) URLs to public hosts; never our own host (redirect loops) or local/private addresses
+function safeOut(raw, selfHost) {
+  let v = String(raw || '').trim(); if (!v) return null; if (v.startsWith('//')) v = 'https:' + v;
+  let u; try { u = new URL(v); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol) || !u.hostname || u.username || u.password) return null;
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (h === selfHost || /(^|\.)onrender\.com$/.test(h) && h === selfHost) return null;
+  if (/(^|\.)orvia-x32p\.onrender\.com$/.test(h)) return null;
+  if (h === 'localhost' || /\.(local|internal|localhost)$/.test(h) || !h.includes('.') && !h.includes(':')) return null;
+  if (/^(0|10|127|169\.254|192\.168|172\.(1[6-9]|2\d|3[01]))\./.test(h) || /^(::1?|f[cd][0-9a-f]{2}:|fe80:)/i.test(h) || /^\d+$/.test(h)) return null;
+  return u.href;
+}
+const frameCache = new Map();
+async function frameable(url) {
+  const c = frameCache.get(url); if (c && Date.now() - c.t < 3600e3) return c.v;
+  let v = false;
+  try {
+    const r = await fetch(url, { method: 'GET', redirect: 'follow', signal: AbortSignal.timeout(1400), headers: { 'User-Agent': require('./lib/http').UA, Accept: 'text/html' } });
+    const xfo = (r.headers.get('x-frame-options') || '').toLowerCase(), csp = (r.headers.get('content-security-policy') || '').toLowerCase(), ct = r.headers.get('content-type') || '';
+    const fa = (csp.match(/frame-ancestors([^;]*)/) || [])[1];
+    v = r.ok && /text\/html/.test(ct) && !xfo && (fa === undefined || /(^|\s)\*(\s|$)/.test(fa)) && safeOut(r.url) !== null;
+    try { r.body && r.body.cancel(); } catch {}
+  } catch { v = false; }
+  frameCache.set(url, { v, t: Date.now() }); if (frameCache.size > 500) frameCache.delete(frameCache.keys().next().value);
+  return v;
+}
 
 // ---------- the search pipeline ----------
 async function search(q, page, cc, nc) {
@@ -103,11 +132,16 @@ http.createServer(async (req, res) => {
   const cc = (u.searchParams.get('cc') || '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 2);
   const json = (d, c = 200) => send(req, res, c, JSON.stringify(d), { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   try {
+    if (u.pathname === '/go') { // same-origin redirect to an external result
+      const dest = safeOut(u.searchParams.get('u'), (req.headers.host || '').split(':')[0].toLowerCase());
+      if (!dest) return send(req, res, 400, 'Invalid or unsafe link', { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
+      res.writeHead(302, { Location: dest, 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store, max-age=0', 'X-Content-Type-Options': 'nosniff' }); return res.end();
+    }
     if (u.pathname.startsWith('/api/')) {
       const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim(); const n = (hits.get(ip) || 0) + 1; hits.set(ip, n);
       if (n > 240) return json({ error: 'Too many requests, slow down for a moment.' }, 429);
       if (u.pathname === '/api/ping') return json({ ok: true, v: VERSION, t: Date.now() });
-      if (u.pathname === '/api/health') return json({ ok: true, v: VERSION, uptime: Math.round((Date.now() - STARTED) / 1000), upstream: health });
+      if (u.pathname === '/api/health') return json({ ok: true, v: VERSION, uptime: Math.round((Date.now() - STARTED) / 1000), upstream: health, links: S.linkStats });
       if (u.pathname === '/api/search') { if (!q) return json({ results: [], answers: [], meta: {} }); if (q.length > 300) return json({ error: 'Query too long' }, 400); return json(await search(q, page, cc, u.searchParams.get('nc') === '1')); }
       if (u.pathname === '/api/images') { if (!q) return json({ results: [] }); const r = await S.images(q, page, cc); return json({ ...r, meta: { source: r.source, degraded: r.source === 'commons', message: r.source === 'commons' ? 'Image search is limited right now — showing Wikimedia Commons images.' : (r.results.length ? '' : 'No images found. Try again in a moment.') } }); }
       if (u.pathname === '/api/news') { if (!q) return json({ results: [] }); const r = await S.news(q, 0, cc); return json({ results: r, meta: { message: r.length ? '' : 'No news found right now. Try again in a moment.' } }); }
@@ -119,6 +153,7 @@ http.createServer(async (req, res) => {
         const out = [], seen = new Set(); for (let i = 0; i < 12; i++) for (const l of lists) { const a = l[i]; if (a && !seen.has(a.title)) { seen.add(a.title); out.push(a); } }
         return json({ results: out });
       }
+      if (u.pathname === '/api/frame') { const d = safeOut(u.searchParams.get('u'), (req.headers.host || '').split(':')[0].toLowerCase()); return json({ frame: d ? await frameable(d) : false, ok: !!d }); }
       if (u.pathname === '/api/suggest') return json(q ? await S.suggest(q) : []);
       return json({ error: 'Not found' }, 404);
     }

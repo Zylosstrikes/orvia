@@ -1,6 +1,10 @@
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const su=u=>/^https?:\/\//i.test(String(u||''))?esc(u):'#';
+// normalise any URL to an absolute http(s) URL or '' (never '#')
+const nu=u=>{u=String(u??'').trim();if(!u)return'';if(u.startsWith('//'))u='https:'+u;try{const x=new URL(u);return/^https?:$/.test(x.protocol)&&x.hostname?x.href:''}catch{return''}};
+const su=u=>esc(nu(u)); // for <img src>: empty instead of '#'
+// attributes for an external link: a real destination href (works even if JS fails); if the URL is unusable, render a non-link
+const lk=(u,title='')=>{const h=nu(u);return h?`href="${esc(h)}" rel="noopener noreferrer" data-ext data-visit="${esc(title)}"`:`data-dead aria-disabled="true" title="Link unavailable"`};
 const host=u=>{try{return new URL(u).hostname.replace(/^www\./,'')}catch{return''}};
 const fav=u=>!host(u)?'<span class="fav"></span>':`<img class="fav" src="https://icons.duckduckgo.com/ip3/${host(u)}.ico" onerror="this.style.visibility='hidden'">`;
 const S={get:(k,d=[])=>{try{const v=JSON.parse(localStorage['orvia_'+k]);if(v==null||(Array.isArray(d)&&!Array.isArray(v))||typeof v!==typeof d)return d;return Array.isArray(v)?v.filter(x=>x!=null):v}catch{return d}},set:(k,v)=>{try{localStorage['orvia_'+k]=JSON.stringify(v)}catch{}}};
@@ -24,25 +28,45 @@ async function api(url,{retries=2,timeout=45000}={}){
   }catch(e){if(e.final||i>=retries)throw e;await sleep(700*(i+1))}}
  }finally{clearTimeout(t);if(shown)wake(false)}}
 const errBox=(m,retry=true)=>`<div class="panel" style="text-align:center"><p style="margin:0 0 12px">${esc(m)}</p>${retry?'<button class="btn p press" onclick="route()">Retry</button>':''}</div>`;
-// ---------- external links: always real <a target=_blank rel="noopener noreferrer">; in an installed PWA fall back to window.open/location ----------
-const isStandalone=()=>matchMedia('(display-mode: standalone)').matches||matchMedia('(display-mode: fullscreen)').matches||navigator.standalone===true;
-document.addEventListener('click',e=>{const a=e.target.closest('a[data-ext]');if(!a||e.defaultPrevented||e.button>0||e.ctrlKey||e.metaKey||e.shiftKey)return;
- if(!isStandalone())return; // regular browser: let the native anchor do its job
- e.preventDefault();let w=null;try{w=window.open(a.href,'_blank')}catch{}if(!w)location.href=a.href;},false);
+// ---------- external links ----------
+// Primary path: open INSIDE the tab (in-app viewer or same-tab navigation). No window.open / target=_blank, so popup
+// blockers, installed PWAs and in-app browsers can't swallow the click. Ctrl/Cmd/middle-click still open a new tab natively.
+const frameCache={};
+async function canFrame(u){const h=host(u);if(h in frameCache)return frameCache[h];
+ try{const r=await fetch('/api/frame?u='+encodeURIComponent(u),{signal:AbortSignal.timeout(1500)});const j=await r.json();return frameCache[h]=!!j.frame}catch{return false}}
+function opening(u,on=true){let o=$('#opening');if(!o){o=document.createElement('div');o.id='opening';o.className='opening';o.setAttribute('role','status');document.body.appendChild(o)}
+ o.innerHTML=`<span class="spin"></span><div><b>Opening ${esc(host(u))}…</b><br><a href="${esc(u)}" rel="noopener noreferrer">Tap here if it doesn’t open</a></div>`;o.classList.toggle('show',on)}
+function go(u){opening(u);try{location.assign(u)}catch{location.href=u}}
+let opBusy=false;
+async function openExt(raw,title){const u=nu(raw);if(!u)return toast('That link is unavailable');if(opBusy)return;opBusy=true;addVisit(u,title||host(u));
+ setTimeout(()=>opBusy=false,2500);opening(u);
+ let f=false;try{f=await canFrame(u)}catch{}
+ if(f){opening(u,false);history.pushState({framed:1},'','/view?u='+encodeURIComponent(u)+'&t='+encodeURIComponent(title||''));route()}else go(u)}
+document.addEventListener('click',e=>{if(e.defaultPrevented||e.button>0||e.ctrlKey||e.metaKey||e.shiftKey||e.altKey)return;
+ const a=e.target.closest('a[data-ext]');
+ if(a){e.preventDefault();e.stopPropagation();closeAll();openExt(a.getAttribute('href'),a.dataset.visit||a.textContent.trim().slice(0,120));return}
+ const c=e.target.closest('.fc[data-url]');if(c&&!e.target.closest('button,a')){e.preventDefault();openExt(c.dataset.url,c.dataset.title)}
+ if(e.target.closest('[data-dead]')){e.preventDefault();toast('That link is unavailable')}},true);
+// coming back from a site (bfcache): hide the "Opening…" banner
+addEventListener('pageshow',()=>{opening('',false);opBusy=false});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')setTimeout(()=>{$('#opening')?.classList.remove('show');opBusy=false},400)});
 
 document.addEventListener('pointerdown',e=>{if(e.target.closest('.press,button'))buzz()});
 // ---------- data ----------
 function addHist(q,ai=false){q=q.trim();if(!q)return;S.set('hist',[{q,ai,t:Date.now()},...S.get('hist').filter(h=>!(h.q===q&&h.ai===ai))].slice(0,100))}
 function addVisit(url,title){S.set('visits',[{url,title,t:Date.now()},...S.get('visits').filter(v=>v.url!==url)].slice(0,100))}
-document.addEventListener('click',e=>{const a=e.target.closest('a[data-visit]');if(a)addVisit(a.href,a.dataset.visit)},true);
 // ---------- router ----------
 let feedTimer;
 function nav(path,push=true){if(push)history.pushState({},'',path);route()}
-document.addEventListener('click',e=>{const a=e.target.closest('a[href^="/"]');if(!a||a.target||e.ctrlKey||e.metaKey)return;e.preventDefault();closeAll();nav(a.getAttribute('href'))});
+const ROUTES=new Set(['/','/search','/results','/ai','/activity','/notifications','/view']);
+document.addEventListener('click',e=>{if(e.defaultPrevented||e.button>0||e.ctrlKey||e.metaKey||e.shiftKey)return;const a=e.target.closest('a[href]');if(!a||a.target||a.hasAttribute('data-ext')||a.hasAttribute('download'))return;
+ const raw=a.getAttribute('href');if(!raw.startsWith('/')||raw.startsWith('//'))return;let x;try{x=new URL(a.href)}catch{return}
+ if(x.origin!==location.origin||!ROUTES.has(x.pathname))return; // e.g. /go, /api, files: let the browser handle it
+ e.preventDefault();closeAll();nav(x.pathname+x.search)});
 onpopstate=()=>{if($('.open')){closeAll(false);}route()};
-function route(){clearTimeout(feedTimer);clearInterval(liveTimer);const p=location.pathname,q=new URLSearchParams(location.search);window.scrollTo(0,0);
+function route(){document.body.classList.remove('viewing');$('#opening')?.classList.remove('show');clearTimeout(feedTimer);clearInterval(liveTimer);const p=location.pathname,q=new URLSearchParams(location.search);window.scrollTo(0,0);
  const tab=p==='/ai'?'ai':p==='/'?'home':p.startsWith('/search')||p==='/results'?'search':p.slice(1);$$('.bnav a').forEach(a=>a.classList.toggle('on',a.dataset.nav===tab||false));
- ({'/':Home,'/search':SearchScreen,'/results':Results,'/ai':AI,'/activity':Activity,'/notifications':Notifs}[p]||Home)(q);
+ ({'/':Home,'/search':SearchScreen,'/results':Results,'/ai':AI,'/activity':Activity,'/notifications':Notifs,'/view':Viewer}[p]||Home)(q);
  $('#ndot').classList.toggle('show',!S.get('notifSeen',false));}
 // ---------- shared ----------
 function voice(inp,btn,cb){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return toast('Voice search not supported in this browser');
@@ -97,7 +121,7 @@ const feed={shown:new Set(),busy:false,
   try{const d=await api('/api/feed?'+ccq.slice(1)+'&first='+(reset?0:1+(Math.random()*3|0)*10)+'&topics='+encodeURIComponent(tp.map(x=>x.t).join('|')));
    const mine=Object.fromEntries(tp.map(x=>[x.t,x.mine])),likes=S.get('likes');const items=d.results.filter(a=>!this.shown.has(a.title)).sort(()=>Math.random()-.3);S.set('lastFeed',items.slice(0,30));
    const html=items.map((a,i)=>{this.shown.add(a.title);return`<article class="fc" style="animation-delay:${i*70}ms" data-topic="${esc(a.topic)}" data-url="${esc(a.url)}" data-title="${esc(a.title)}">
-    <a href="${su(a.url)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(a.title)}"><div class="im"><img loading="lazy" src="${su(a.image)}" alt="" onerror="this.closest('.im').classList.add('noimg');this.remove()"><span class="why">${mine[a.topic]?'Because you searched “'+esc(a.topic)+'”':'Trending · '+esc(a.topic)}</span></div><h3>${esc(a.title)}</h3></a>
+    <a ${lk(a.url,a.title)}><div class="im"><img loading="lazy" src="${su(a.image)}" alt="" onerror="this.closest('.im').classList.add('noimg');this.remove()"><span class="why">${mine[a.topic]?'Because you searched “'+esc(a.topic)+'”':'Trending · '+esc(a.topic)}</span></div><h3>${esc(a.title)}</h3></a>
     <div class="ft">${fav(a.url)}<span>${esc((a.source||host(a.url)).replace(/ on MSN$/,''))} · ${ago(a.date)}</span><span class="sp"></span><button class="iconbtn press like ${likes.includes(a.url)?'liked':''}" aria-label="Like">♥</button><button class="iconbtn press share" aria-label="Share">⤴</button><button class="iconbtn press dots" aria-label="More">⋮</button></div></article>`}).join('');
    const f=$('#feed');if(!f)return;if(reset){$$('.fc,.sk',f).forEach(c=>c.classList.add('out'));await new Promise(r=>setTimeout(r,$('.fc',f)?350:0));f.innerHTML=html}else f.insertAdjacentHTML('beforeend',html);
    $('#fstat').textContent='Updated '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
@@ -133,8 +157,8 @@ function answerCard(a){
  if(a.type==='time')return`<div class="panel ac" data-tz="${esc(a.tz)}"><h4>Time in ${esc(a.place)}</h4><div class="bignum t">--:--:--</div><div class="muted d"></div></div>`;
  if(a.type==='weather'){const c=a.current,d=a.daily;return`<div class="panel ac"><h4>Weather · ${esc(a.place)}</h4><div style="font-size:40px">${wi(c.weather_code)} ${Math.round(c.temperature_2m)}°C</div><small class="muted">Feels ${Math.round(c.apparent_temperature??c.temperature_2m)}° · Humidity ${c.relative_humidity_2m}% · Wind ${c.wind_speed_10m} km/h</small><div class="wk">${d.time.map((t,i)=>`<div><small>${new Date(t+'T12:00').toLocaleDateString(undefined,{weekday:'short'})}</small><div>${wi(d.weather_code[i])}</div><small>${Math.round(d.temperature_2m_max[i])}°/${Math.round(d.temperature_2m_min[i])}°</small></div>`).join('')}</div><small class="muted">Open-Meteo</small></div>`}
  return''}
-function wikiCard(w){if(!w)return'';return`<div class="panel ac kp">${w.image?`<img src="${su(w.image)}" alt="" loading="lazy" onerror="this.remove()">`:''}<h4>Knowledge panel</h4><div style="font-size:20px;font-weight:600">${esc(w.title)}</div><div class="muted" style="margin-bottom:6px">${esc(w.description)}</div><p class="kpx">${esc(w.extract)}</p>${w.facts&&w.facts.length?`<dl class="facts">${w.facts.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`:''}<a href="${su(w.url)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(w.title)} – Wikipedia" style="color:var(--a);font-size:13px">Wikipedia ↗</a></div>`}
-function storiesCard(list){if(!list||!list.length)return'';return`<div class="panel ac"><h4>Top stories</h4><div class="stories">${list.map(a=>`<a class="story press" href="${su(a.url)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(a.title)}">${a.image?`<img src="${su(a.image)}" alt="" loading="lazy" onerror="this.remove()">`:''}<b>${esc(a.title)}</b><small class="muted">${esc((a.source||host(a.url)).replace(/ on MSN$/,''))}${a.date?' · '+ago(a.date):''}</small></a>`).join('')}</div></div>`}
+function wikiCard(w){if(!w)return'';return`<div class="panel ac kp">${w.image?`<img src="${su(w.image)}" alt="" loading="lazy" onerror="this.remove()">`:''}<h4>Knowledge panel</h4><div style="font-size:20px;font-weight:600">${esc(w.title)}</div><div class="muted" style="margin-bottom:6px">${esc(w.description)}</div><p class="kpx">${esc(w.extract)}</p>${w.facts&&w.facts.length?`<dl class="facts">${w.facts.map(([k,v])=>`<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`:''}<a ${lk(w.url,w.title+' – Wikipedia')} style="color:var(--a);font-size:13px">Wikipedia ↗</a></div>`}
+function storiesCard(list){if(!list||!list.length)return'';return`<div class="panel ac"><h4>Top stories</h4><div class="stories">${list.map(a=>`<a class="story press" ${lk(a.url,a.title)}>${a.image?`<img src="${su(a.image)}" alt="" loading="lazy" onerror="this.remove()">`:''}<b>${esc(a.title)}</b><small class="muted">${esc((a.source||host(a.url)).replace(/ on MSN$/,''))}${a.date?' · '+ago(a.date):''}</small></a>`).join('')}</div></div>`}
 const rl=(s)=>`<a class="chip press" href="/results?q=${encodeURIComponent(s)}">${esc(s)}</a>`;
 async function Results(p){const q=p.get('q')||'',tab=p.get('tab')||'web',page=Math.max(1,parseInt(p.get('page'))||1),nc=p.get('nc')?'&nc=1':'';addHist(q);document.title=q+' · '+NAME;clearInterval(liveTimer);
  const u=(t,pg=1)=>`/results?q=${encodeURIComponent(q)}&tab=${t}&page=${pg}`;
@@ -144,15 +168,15 @@ async function Results(p){const q=p.get('q')||'',tab=p.get('tab')||'web',page=Ma
  const tok=window._rtok={};
  try{const d=await api(`/api/${tab==='web'?'search':tab}?q=${encodeURIComponent(q)}&page=${page}${ccq}${nc}`);if(!$('#rs')||window._rtok!==tok)return;let h='';
   const notice=d.meta&&d.meta.message?`<div class="banner ${d.meta.degraded?'warn':''}">${esc(d.meta.message)} <a href="#" onclick="route();return false">Retry</a></div>`:'';
-  if(tab==='images')h=notice+(d.results.length?`<div class="imgs">${d.results.map(r=>`<a href="${su(r.url||r.img)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(r.title||q)}"><img loading="lazy" alt="${esc(r.title)}" src="${su(r.thumb)}" onerror="this.closest('a').remove()"></a>`).join('')}</div>`:'');
-  else if(tab==='news')h=notice+d.results.map(r=>`<div class="res rn">${r.image?`<img class="thumb" src="${su(r.image)}" alt="" loading="lazy" onerror="this.remove()">`:''}<div><a href="${su(r.url)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(r.title)}"><div class="u">${fav(r.url)}${esc((r.source||host(r.url)).replace(/ on MSN$/,''))}${r.date?' · '+ago(r.date):''}</div><h3>${hl(r.title,q)}</h3></a><p>${esc(r.snippet)}</p></div></div>`).join('');
+  if(tab==='images')h=notice+(d.results.length?`<div class="imgs">${d.results.map(r=>`<a ${lk(r.url||r.img,r.title||q)}><img loading="lazy" alt="${esc(r.title)}" src="${su(r.thumb)}" onerror="this.closest('a').remove()"></a>`).join('')}</div>`:'');
+  else if(tab==='news')h=notice+d.results.map(r=>`<div class="res rn">${r.image?`<img class="thumb" src="${su(r.image)}" alt="" loading="lazy" onerror="this.remove()">`:''}<div><a ${lk(r.url,r.title)}><div class="u">${fav(r.url)}${esc((r.source||host(r.url)).replace(/ on MSN$/,''))}${r.date?' · '+ago(r.date):''}</div><h3>${hl(r.title,q)}</h3></a><p>${esc(r.snippet)}</p></div></div>`).join('');
   else{
    if(d.corrected)h+=`<div class="banner">Showing results for <b>${esc(d.corrected.to)}</b>. <a href="/results?q=${encodeURIComponent(q)}&nc=1">Search instead for ${esc(q)}</a></div>`;
    else if(d.didYouMean)h+=`<div class="banner">Did you mean <a href="/results?q=${encodeURIComponent(d.didYouMean)}"><b>${esc(d.didYouMean)}</b></a>?</div>`;
    h+=notice;
    (d.answers||[]).forEach(a=>h+=answerCard(a));h+=wikiCard(d.wiki)+storiesCard(d.topStories);
    if(d.summary?.length&&!d.wiki&&!(d.answers||[]).some(a=>['calc','convert','time','weather','define'].includes(a.type)))h+=`<a href="/ai?q=${encodeURIComponent(q)}" class="panel press" style="display:block"><h4>✦ Pulse overview</h4><p style="margin:0;color:#c8cbd2">${esc(d.summary[0].text)}</p><small style="color:var(--a)">Dive deeper in Pulse ›</small></a>`;
-   h+=d.results.map(r=>`<div class="res"><a href="${su(r.url)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(r.title)}"><div class="u">${fav(r.url)}${esc(host(r.url))}</div><h3>${hl(r.title,q)}</h3></a><p>${hl(r.snippet,q)}</p></div>`).join('');
+   h+=d.results.map(r=>`<div class="res"><a ${lk(r.url,r.title)}><div class="u">${fav(r.url)}${esc(host(r.url))}</div><h3>${hl(r.title,q)}</h3></a><p>${hl(r.snippet,q)}</p></div>`).join('');
    if(!d.results.length&&!(d.answers||[]).length&&!d.wiki)h+=errBox((d.meta&&d.meta.message)||'No results found.');
    if(d.paa?.length)h+=`<div class="panel"><h4>People also ask</h4>${d.paa.map(s=>`<a class="paa press" href="/results?q=${encodeURIComponent(s)}"><span>${esc(s)}</span><span>›</span></a>`).join('')}</div>`;
    if(d.related?.length)h+=`<div class="panel"><h4>Related searches</h4><div class="chips">${d.related.map(rl).join('')}</div></div>`;
@@ -165,12 +189,12 @@ async function answer(q){const d=await api('/api/search?q='+encodeURIComponent(q
  return{q,wiki:d.wiki?{title:d.wiki.title,extract:d.wiki.extract,url:d.wiki.url}:null,calc:(d.answers||[]).filter(x=>['calc','convert','define','time'].includes(x.type)).map(x=>x.type==='calc'?`${x.expr} = ${x.pretty}`:x.type==='convert'?`${x.from} = ${x.to}`:x.type==='time'?`Local time in ${x.place}: ${new Date().toLocaleTimeString('en-GB',{timeZone:x.tz,hour:'2-digit',minute:'2-digit'})}`:`${x.word}: ${x.meanings[0]?.def||''}`),weather:(d.answers||[]).find(x=>x.type==='weather')||d.weather||null,sum:(d.summary||[]),note:d.meta&&d.meta.message||'',src:src.map(r=>({title:r.title,url:r.url,snippet:r.snippet}))}}
 function renderAns(a){const parts=[];if(a.weather){const c=a.weather.current;parts.push(`<p><b>Right now in ${esc(a.weather.place)}:</b> ${wi(c.weather_code)} ${Math.round(c.temperature_2m)}°C, humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h <span class="cite">Open-Meteo</span></p>`)}
  (a.calc||[]).forEach(t=>parts.push(`<p><b>${esc(t)}</b></p>`));
- if(a.wiki)parts.push(`<p><b>${esc(a.wiki.title)}</b> — ${esc(a.wiki.extract.split(/(?<=[.!?])\s+/).slice(0,3).join(' '))} <a class="cite" href="${su(a.wiki.url)}" target="_blank" rel="noopener noreferrer" data-ext>Wikipedia</a></p>`);
+ if(a.wiki)parts.push(`<p><b>${esc(a.wiki.title)}</b> — ${esc(a.wiki.extract.split(/(?<=[.!?])\s+/).slice(0,3).join(' '))} <a class="cite" ${lk(a.wiki.url,'')}>Wikipedia</a></p>`);
  else if(a.instant)parts.push(`<p><b>${esc(a.instant.heading)}</b> — ${esc(a.instant.text.split(/(?<=\.)\s/).slice(0,3).join(' '))} <span class="cite">${esc(a.instant.source)}</span></p>`);
- if(a.sum.length)parts.push('<p>'+a.sum.filter(s=>s.ref>=1).map(s=>`${esc(s.text)}<a class="cite" href="${su(a.src[s.ref-1]?.url)}" target="_blank" rel="noopener noreferrer" data-ext>${s.ref}</a>`).join(' ')+'</p>');
+ if(a.sum.length)parts.push('<p>'+a.sum.filter(s=>s.ref>=1).map(s=>`${esc(s.text)}<a class="cite" ${lk(a.src[s.ref-1]?.url,'')}>${s.ref}</a>`).join(' ')+'</p>');
  if(!parts.length)parts.push('<p>I couldn’t find enough in the results to summarise. Try rephrasing.</p>');
  return`<div class="msg-q">${esc(a.q)}</div><div class="ans"><div class="lbl">✦ Pulse · summary of web results</div>${a.note?`<div class="banner warn">${esc(a.note)}</div>`:''}${parts.join('')}
- <div class="srcs">${a.src.map((s,i)=>`<a class="src press" href="${su(s.url)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(s.title)}"><span style="display:flex;gap:6px;align-items:center;color:var(--m)">${fav(s.url)}${i+1} · ${esc(host(s.url))}</span><b>${esc(s.title)}</b></a>`).join('')}</div>
+ <div class="srcs">${a.src.map((s,i)=>`<a class="src press" ${lk(s.url,s.title)}><span style="display:flex;gap:6px;align-items:center;color:var(--m)">${fav(s.url)}${i+1} · ${esc(host(s.url))}</span><b>${esc(s.title)}</b></a>`).join('')}</div>
  <div class="disc">Extractive summary: sentences are quoted from the linked search results. No generative AI is used, so check sources.</div></div>`}
 async function AI(p){let id=p.get('t'),th=S.get('threads').find(t=>t.id===id);const q0=p.get('q');
  app.innerHTML=`<div class="screen"><div class="topbar"><button class="iconbtn press" id="menu">⋯</button><b style="font-weight:500">✦ Pulse</b><a class="iconbtn press" href="/ai" title="Start a Pulse">✎</a></div><div id="chat">${th?th.msgs.map(renderAns).join(''):`<div style="text-align:center;margin-top:18vh;color:var(--m)"><div class="wm" style="margin:0 0 10px"><img src="/icon.svg"></div>Ask anything. ${NAME} reads the web and gives you a summary with sources.</div>`}</div><div style="height:90px"></div>
@@ -188,7 +212,7 @@ function Activity(p){const all=p.get('all');const th=S.get('threads'),h=S.get('h
  app.innerHTML=`<div class="screen"><div class="topbar"><div class="avatar">Z</div><b style="font-weight:500">Trail</b><button class="iconbtn press" id="menu">⋯</button></div>
  ${all!=='hist'?`<a class="sec press" href="/activity?all=ai"><h2>Pulse history</h2><span>›</span></a><div class="list">${th.slice(0,all==='ai'?999:4).map(t=>`<div class="row" data-k="t" data-id="${t.id}"><span class="ri" style="color:var(--a)">✦</span><a class="rt" href="/ai?t=${t.id}"><div>${esc(t.title)}</div><small>${fmt(t.t)} · ${t.msgs.length} answer${t.msgs.length===1?'':'s'}</small></a><button class="iconbtn dots" style="color:var(--m)">⋮</button></div>`).join('')||'<p style="color:var(--m)">No Pulses yet</p>'}</div>`:''}
  ${all!=='ai'?`<a class="sec press" href="/activity?all=hist"><h2>Searches &amp; visits</h2><span>›</span></a><div class="list">${items.slice(0,all==='hist'?999:8).map(x=>x.k==='q'?`<div class="row" data-k="q" data-t="${x.t}"><span class="ri">⌕</span><a class="rt" href="/results?q=${encodeURIComponent(x.q)}"><div>Searched for ${esc(x.q)}</div><small>${fmt(x.t)}</small></a><button class="iconbtn dots" style="color:var(--m)">⋮</button></div>`
-  :`<div class="row" data-k="v" data-t="${x.t}"><span class="ri">${fav(x.url)}</span><a class="rt" href="${su(x.url)}" target="_blank" rel="noopener noreferrer" data-ext><div>${esc(x.title||x.url)}</div><small>${esc(host(x.url))} · ${fmt(x.t)}</small></a><button class="iconbtn dots" style="color:var(--m)">⋮</button></div>`).join('')||'<p style="color:var(--m)">No history yet</p>'}</div>`:''}</div>`;
+  :`<div class="row" data-k="v" data-t="${x.t}"><span class="ri">${fav(x.url)}</span><a class="rt" ${lk(x.url,x.title||'')}><div>${esc(x.title||x.url)}</div><small>${esc(host(x.url))} · ${fmt(x.t)}</small></a><button class="iconbtn dots" style="color:var(--m)">⋮</button></div>`).join('')||'<p style="color:var(--m)">No history yet</p>'}</div>`:''}</div>`;
  $('#menu').onclick=openDrawer;
  $('.screen').onclick=e=>{const b=e.target.closest('.dots');if(!b)return;const r=b.closest('.row');sheet([['🗑 &nbsp;Delete',()=>{const k=r.dataset.k;
   if(k==='t')S.set('threads',S.get('threads').filter(t=>t.id!==r.dataset.id));if(k==='q')S.set('hist',S.get('hist').filter(x=>String(x.t)!==r.dataset.t));if(k==='v')S.set('visits',S.get('visits').filter(x=>String(x.t)!==r.dataset.t));
@@ -203,14 +227,26 @@ async function Notifs(){S.set('notifSeen',true);const perm=window.Notification?N
  $('#nyes')&&($('#nyes').onclick=async()=>{const r=await Notification.requestPermission();if(r==='granted'){navigator.serviceWorker?.ready.then(s=>s.showNotification(NAME,{body:'Signals are on. We’ll keep you posted.',icon:'/icon-192.png'})).catch(()=>new Notification(NAME,{body:'Signals are on.'}))}$('#nc')?.remove();toast(r==='granted'?'Signals on':'Permission '+r)});
  const tp=(topics.length?topics:['world news','technology','football']).slice(0,5);
  try{const d=await api('/api/feed?topics='+encodeURIComponent(tp.join('|'))+ccq);const by={};d.results.forEach(a=>{by[a.topic]=by[a.topic]||a});
-  if(!$('#nl'))return;$('#nl').innerHTML=Object.values(by).map(a=>`<a class="row press" href="${su(a.url)}" target="_blank" rel="noopener noreferrer" data-ext data-visit="${esc(a.title)}"><img class="thumb" src="${su(a.image)}" alt=""><div class="rt"><small style="color:var(--a)">${esc(a.topic)} · ${ago(a.date)}</small><div style="white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(a.title)}</div><small>${esc((a.source||'').replace(/ on MSN$/,''))}</small></div></a>`).join('')||'<p style="color:var(--m)">No Signals yet</p>';
+  if(!$('#nl'))return;$('#nl').innerHTML=Object.values(by).map(a=>`<a class="row press" ${lk(a.url,a.title)}><img class="thumb" src="${su(a.image)}" alt=""><div class="rt"><small style="color:var(--a)">${esc(a.topic)} · ${ago(a.date)}</small><div style="white-space:normal;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(a.title)}</div><small>${esc((a.source||'').replace(/ on MSN$/,''))}</small></div></a>`).join('')||'<p style="color:var(--m)">No Signals yet</p>';
  }catch{$('#nl')&&($('#nl').innerHTML=errBox('Couldn’t load Signals.'))}}
+// ---------- in-app viewer (/view?u=URL&t=title) ----------
+function Viewer(q){const u=nu(q.get('u')),t=q.get('t')||host(u);if(!u){nav('/',false);return}
+ document.body.classList.add('viewing');
+ app.innerHTML=`<div class="viewer"><div class="vbar"><button class="iconbtn press" id="vback" aria-label="Back">←</button><div class="vt"><b>${esc(t)}</b><small>${fav(u)}${esc(host(u))}</small></div><a class="btn p press" id="vopen" href="${esc(u)}" rel="noopener noreferrer">Open ↗</a></div>
+  <div class="vbody"><div class="vload"><span class="spin"></span> Loading ${esc(host(u))}…</div><iframe id="vf" title="${esc(t)}" referrerpolicy="no-referrer" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe></div></div>`;
+ const back=()=>{if(history.state&&history.state.framed&&history.length>1)history.back();else nav('/')};
+ $('#vback').onclick=back;$('#vopen').onclick=e=>{if(e.ctrlKey||e.metaKey||e.shiftKey)return;e.preventDefault();e.stopPropagation();go(u)};
+ const f=$('#vf');let loaded=false;f.onload=()=>{if(f.src){loaded=true;$('.vload')?.remove()}};f.onerror=()=>go(u);
+ const start=ok=>{if(location.pathname!=='/view')return;if(!ok){opening(u);location.replace(u);return}f.src=u;
+  setTimeout(()=>{if(!loaded&&location.pathname==='/view'&&$('#vf')===f)go(u)},10000)};
+ // came here from a click (already checked) -> show; direct entry / reload -> check first
+ if(history.state&&history.state.framed)start(true);else canFrame(u).then(start)}
 // ---------- boot ----------
 (()=>{const q=new URLSearchParams(location.search);if(q.get('seed')){const n=Date.now(),H=36e5;
  S.set('hist',[['SpaceX Starship',0],['Afrobeats new releases',1],['Lagos traffic',3],['what is quantum computing',4,1],['weather Lagos',6],['Nigeria football',26],['bitcoin price',30],['best phones 2026',50,1]].map(([q,h,ai])=>({q,ai:!!ai,t:n-h*H})));
  S.set('visits',[{url:'https://www.space.com/spacex-starship',title:'SpaceX Starship launch updates – Space.com',t:n-.5*H},{url:'https://en.wikipedia.org/wiki/Lagos',title:'Lagos – Wikipedia',t:n-3.2*H},{url:'https://www.billboard.com/c/music/afrobeats/',title:'Afrobeats – Billboard',t:n-27*H}]);
  S.set('notifSeen',false);
  q.delete('seed');const go=q.get('go')||'/';q.delete('go');const dr=q.get('drawer');q.delete('drawer');history.replaceState({},'',go+(q.toString()?'?'+q:''));route();if(dr)openDrawer();return}route()})();
-if('serviceWorker'in navigator){const had=!!navigator.serviceWorker.controller;let reloaded=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(had&&!reloaded){reloaded=true;location.reload()}});navigator.serviceWorker.register('/sw.js').then(r=>r.update().catch(()=>{})).catch(()=>{})}
+if('serviceWorker'in navigator){const had=!!navigator.serviceWorker.controller;let reloaded=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(had&&!reloaded){reloaded=true;location.reload()}});navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).then(r=>{r.update().catch(()=>{});if(r.waiting)r.waiting.postMessage('skipWaiting')}).catch(()=>{})}
 api('/api/ping',{retries:1}).catch(()=>{}); // wake a sleeping free-tier server early
 addEventListener('keydown',e=>{if(/INPUT/.test(document.activeElement.tagName))return;if(e.key==='/'){e.preventDefault();nav('/search')}if(e.key==='a'&&!e.ctrlKey)nav('/ai');if(e.key==='Escape')closeAll()});
